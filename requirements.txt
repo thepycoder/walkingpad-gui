@@ -1,0 +1,10 @@
+# WalkingPad GUI Controller Dependencies
+# Minimal dependencies for the GUI application
+
+# WalkingPad communication library
+ph4-walkingpad>=1.0.2
+
+# HTTP requests for Home Assistant integration
+requests>=2.25.0
+
+# Note: tkinter, asyncio, threading are part of Python standard library 

@@ -7,4 +7,7 @@ ph4-walkingpad>=1.0.2
 # HTTP requests for Home Assistant integration
 requests>=2.25.0
 
-# Note: tkinter, asyncio, threading are part of Python standard library 
+# Qt6 GUI framework
+PyQt6>=6.4.0
+
+# Note: asyncio, threading are part of Python standard library 

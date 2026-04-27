@@ -5,7 +5,7 @@
 
 echo "Starting WalkingPad GUI Controller..."
 
-cd /home/victor/Projects/walkingpad/walkingpad-gui
+cd /home/victor/Projects/walkingpad-gui/
 
 # Activate virtual environment if it exists
 if [ -d ".venv" ]; then
@@ -19,7 +19,7 @@ if command -v walkingpad-gui >/dev/null 2>&1; then
     walkingpad-gui
 elif command -v python3 >/dev/null 2>&1; then
     echo "Running with python3..."
-    python3 main.py
+    python main.py
 elif command -v python >/dev/null 2>&1; then
     echo "Running with python..."
     python main.py

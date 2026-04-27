@@ -4,8 +4,7 @@ WalkingPad GUI Controller
 A simple, compact GUI for controlling WalkingPad treadmills with Home Assistant integration.
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox
+import sys
 import asyncio
 import threading
 import time
@@ -15,6 +14,13 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime
+
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                            QHBoxLayout, QGridLayout, QLabel, QPushButton, 
+                            QLineEdit, QGroupBox, QDialog, QTabWidget, 
+                            QMessageBox, QFrame)
+from PyQt6.QtCore import QTimer, pyqtSignal, QObject, QThread
+from PyQt6.QtGui import QFont, QPalette
 
 from ph4_walkingpad.pad import Controller, WalkingPadCurStatus, WalkingPad
 
@@ -126,17 +132,160 @@ class HomeAssistantSync:
             return False
 
 
-class WalkingPadGUI:
+class AsyncWorker(QObject):
+    """Worker class to handle async operations in a separate thread"""
+    status_updated = pyqtSignal(object)
+    connection_changed = pyqtSignal(bool)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.loop = None
+        self.controller = Controller()
+        self.connected = False
+        
+    def setup_loop(self):
+        """Setup the asyncio event loop for this thread"""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+    def run_loop(self):
+        """Run the asyncio event loop"""
+        if self.loop:
+            self.loop.run_forever()
+            
+    def stop_loop(self):
+        """Stop the asyncio event loop"""
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            
+    def run_coroutine(self, coro):
+        """Run a coroutine in the event loop"""
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    @staticmethod
+    def _address_to_dbus_path(address: str) -> str:
+        """Convert a MAC address to a BlueZ D-Bus object path"""
+        dev_suffix = address.upper().replace(':', '_')
+        return f"/org/bluez/hci0/dev_{dev_suffix}"
+
+    async def _is_device_connected_system(self, address: str) -> bool:
+        """Check if a BLE device is already connected at the BlueZ/system level via D-Bus"""
+        dbus_path = self._address_to_dbus_path(address)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'busctl', 'get-property', 'org.bluez', dbus_path,
+                'org.bluez.Device1', 'Connected',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            return stdout.decode().strip() == 'b true'
+        except Exception as e:
+            print(f"Failed to check system BT status via D-Bus: {e}")
+            return False
+
+    async def _disconnect_system(self, address: str):
+        """Disconnect a device at the BlueZ/system level via bluetoothctl"""
+        try:
+            print(f"Disconnecting {address} at system level...")
+            proc = await asyncio.create_subprocess_exec(
+                'bluetoothctl', 'disconnect', address,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+            await asyncio.sleep(2)
+        except Exception as e:
+            print(f"Failed to disconnect at system level: {e}")
+
+    async def connect(self, address: str):
+        """Connect to WalkingPad, releasing any existing system-level connection first"""
+        already_connected = await self._is_device_connected_system(address)
+        if already_connected:
+            print(f"Device already connected at system level, releasing before connecting...")
+            await self._disconnect_system(address)
+        try:
+            await self.controller.run(address)
+            self.connected = True
+            self.connection_changed.emit(True)
+        except Exception as ex:
+            self.error_occurred.emit(f"Failed to connect: {ex}")
+
+    async def check_and_auto_connect(self, address: str):
+        """On startup, detect if device is already connected and reconnect cleanly"""
+        try:
+            if not await self._is_device_connected_system(address):
+                return
+            # Device is already connected to BlueZ — bleak cannot connect while it is, so
+            # disconnect at system level first, then reconnect fresh via bleak.
+            print(f"WalkingPad {address} already connected at system level, releasing and reconnecting...")
+            await self._disconnect_system(address)
+            try:
+                await self.controller.run(address)
+                self.connected = True
+                self.connection_changed.emit(True)
+                print("Successfully reconnected after system disconnect")
+            except Exception as ex:
+                print(f"Reconnect after system disconnect failed: {ex}")
+        except Exception as e:
+            print(f"Auto-connect check failed: {e}")
+            
+    async def disconnect(self):
+        """Disconnect from WalkingPad"""
+        try:
+            # Stop belt and switch to standby before disconnecting
+            if hasattr(self.controller, 'last_status') and self.controller.last_status:
+                status = self.controller.last_status
+                if status.belt_state == 1:
+                    await self.controller.stop_belt()
+                    await asyncio.sleep(1.0)
+            await self.controller.switch_mode(WalkingPad.MODE_STANDBY)
+            await self.controller.disconnect()
+            self.connected = False
+            self.connection_changed.emit(False)
+        except Exception as e:
+            print(f"Error disconnecting: {e}")
+            
+    async def get_status(self):
+        """Get current status from WalkingPad"""
+        try:
+            await self.controller.ask_stats()
+            if hasattr(self.controller, 'last_status') and self.controller.last_status:
+                self.status_updated.emit(self.controller.last_status)
+        except Exception as e:
+            print(f"Error getting status: {e}")
+            
+    async def start_belt(self):
+        """Start belt sequence: set manual mode then start belt"""
+        try:
+            await self.controller.switch_mode(WalkingPad.MODE_MANUAL)
+            await asyncio.sleep(1.0)
+            await self.controller.start_belt()
+        except Exception as e:
+            print(f"Error starting belt: {e}")
+            
+    async def stop_belt(self):
+        """Stop the belt"""
+        try:
+            await self.controller.stop_belt()
+        except Exception as e:
+            print(f"Error stopping belt: {e}")
+            
+    async def set_speed(self, speed_kmh: float):
+        """Set belt speed"""
+        try:
+            speed_units = int(speed_kmh * 10)
+            await self.controller.change_speed(speed_units)
+        except Exception as e:
+            print(f"Error setting speed: {e}")
+
+
+class WalkingPadGUI(QMainWindow):
     """Main GUI application for WalkingPad control"""
     
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("WalkingPad Controller")
-        self.root.geometry("170x220")  # Reduced height from 320 to 280
-        self.root.resizable(False, False)
-        
-        # Make window stay on top
-        self.root.attributes('-topmost', True)
+    def __init__(self):
+        super().__init__()
         
         # Configuration file path
         self.config_dir = Path.home() / ".walkingpad_gui"
@@ -147,15 +296,15 @@ class WalkingPadGUI:
         self.sync_interval = 30  # seconds
         self.ha_url = ""
         self.ha_token = ""
-        self.ha_entity_id = "input_number.total_steps_all_time"  # Default to input_number helper
+        self.ha_entity_id = "input_number.total_steps_all_time"
         
         # Load saved configuration
         self.load_config()
         
-        # WalkingPad controller
-        self.controller = Controller()
+        # State variables
         self.connected = False
         self.current_status: Optional[WalkingPadCurStatus] = None
+        self.last_sync_time = 0
         
         # Home Assistant integration
         self.ha_sync = HomeAssistantSync(
@@ -164,20 +313,32 @@ class WalkingPadGUI:
             entity_id=self.ha_entity_id
         )
         
-        # Control state
-        self.last_sync_time = 0
+        # Setup async worker in separate thread
+        self.async_thread = QThread()
+        self.async_worker = AsyncWorker()
+        self.async_worker.moveToThread(self.async_thread)
         
-        # Create GUI elements
-        self.setup_gui()
+        # Connect signals
+        self.async_worker.status_updated.connect(self.update_display)
+        self.async_worker.connection_changed.connect(self.update_connection_status)
+        self.async_worker.error_occurred.connect(self.show_error)
         
-        # Start async loop in separate thread
-        self.loop = asyncio.new_event_loop()
-        self.async_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+        # Setup async loop when thread starts
+        self.async_thread.started.connect(self.async_worker.setup_loop)
+        self.async_thread.started.connect(self.async_worker.run_loop)
         self.async_thread.start()
         
-        # Start periodic status updates
-        self.update_status()
-    
+        # Setup UI
+        self.setup_ui()
+        
+        # Setup status update timer
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.request_status_update)
+        self.status_timer.start(1000)  # 1 second intervals
+        
+        # Auto-connect if device is already connected at system level
+        QTimer.singleShot(1500, self.auto_connect)
+        
     def load_config(self):
         """Load configuration from disk"""
         try:
@@ -218,178 +379,163 @@ class WalkingPadGUI:
             print(f"Configuration saved to {self.config_file}")
         except Exception as e:
             print(f"Failed to save configuration: {e}")
-        
-    def setup_gui(self):
+            
+    def setup_ui(self):
         """Create and arrange GUI elements"""
-        # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky="nsew")
+        self.setWindowTitle("WalkingPad Controller")
+        self.setFixedSize(170, 220)
         
-        # Stats frame (moved to top, no status label)
-        stats_frame = ttk.LabelFrame(main_frame, text="Stats", padding="5")
-        stats_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        # Make window stay on top
+        self.setWindowFlags(self.windowFlags() | 
+                           self.windowFlags().__class__.WindowStaysOnTopHint)
+        
+        # Central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # Main layout
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+        
+        # Stats group box
+        stats_group = QGroupBox("Stats")
+        stats_layout = QGridLayout(stats_group)
         
         # Speed display
-        ttk.Label(stats_frame, text="Speed:").grid(row=0, column=0, sticky=tk.W)
-        self.speed_label = ttk.Label(stats_frame, text="0.0 km/h", font=("TkDefaultFont", 10, "bold"))
-        self.speed_label.grid(row=0, column=1, sticky=tk.E)
+        stats_layout.addWidget(QLabel("Speed:"), 0, 0)
+        self.speed_label = QLabel("0.0 km/h")
+        font = QFont()
+        font.setBold(True)
+        self.speed_label.setFont(font)
+        stats_layout.addWidget(self.speed_label, 0, 1)
         
-        # Steps display (session only)
-        ttk.Label(stats_frame, text="Steps:").grid(row=1, column=0, sticky=tk.W)
-        self.steps_label = ttk.Label(stats_frame, text="0", font=("TkDefaultFont", 10, "bold"))
-        self.steps_label.grid(row=1, column=1, sticky=tk.E)
+        # Steps display
+        stats_layout.addWidget(QLabel("Steps:"), 1, 0)
+        self.steps_label = QLabel("0")
+        self.steps_label.setFont(font)
+        stats_layout.addWidget(self.steps_label, 1, 1)
         
-        # Compact button row frame
-        button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        main_layout.addWidget(stats_group)
         
-        # Connect/Disconnect button (shortened text, will be colored)
-        style = ttk.Style()
-        style.configure("Disconnected.TButton", foreground="red")
-        self.connect_btn = ttk.Button(button_frame, text="C", command=self.toggle_connection, style="Disconnected.TButton", width=4)
-        self.connect_btn.grid(row=0, column=0, padx=(0, 2))
+        # Button row
+        button_layout = QHBoxLayout()
         
-        # Start/Stop button (shortened text)  
-        self.start_btn = ttk.Button(button_frame, text="GO", command=self.toggle_belt, state="disabled", width=4)
-        self.start_btn.grid(row=0, column=1, padx=2)
+        # Connect/Disconnect button
+        self.connect_btn = QPushButton("C")
+        self.connect_btn.setFixedWidth(40)
+        self.connect_btn.clicked.connect(self.toggle_connection)
+        self.set_button_color(self.connect_btn, "red")
+        button_layout.addWidget(self.connect_btn)
         
-        # Settings button (shortened text)
-        settings_btn = ttk.Button(button_frame, text="S", command=self.open_settings, width=4)
-        settings_btn.grid(row=0, column=2, padx=(2, 0))
+        # Start/Stop button
+        self.start_btn = QPushButton("GO")
+        self.start_btn.setFixedWidth(40)
+        self.start_btn.clicked.connect(self.toggle_belt)
+        self.start_btn.setEnabled(False)
+        button_layout.addWidget(self.start_btn)
         
-        # Control frame for speed controls
-        control_frame = ttk.LabelFrame(main_frame, text="Speed", padding="5")
-        control_frame.grid(row=2, column=0, columnspan=3, sticky="ew")
+        # Settings button
+        settings_btn = QPushButton("S")
+        settings_btn.setFixedWidth(40)
+        settings_btn.clicked.connect(self.open_settings)
+        button_layout.addWidget(settings_btn)
         
-        # Speed control
-        speed_frame = ttk.Frame(control_frame)
-        speed_frame.grid(row=0, column=0, columnspan=3, sticky="ew")
+        main_layout.addLayout(button_layout)
         
-        ttk.Button(speed_frame, text="-", command=self.decrease_speed, width=3).grid(row=0, column=0)
-        self.speed_var = tk.StringVar(value="2.0")
-        speed_entry = ttk.Entry(speed_frame, textvariable=self.speed_var, width=6, justify="center")
-        speed_entry.grid(row=0, column=1, padx=5)
-        speed_entry.bind('<Return>', self.set_speed_from_entry)
-        ttk.Button(speed_frame, text="+", command=self.increase_speed, width=3).grid(row=0, column=2)
+        # Speed control group
+        speed_group = QGroupBox("Speed")
+        speed_layout = QHBoxLayout(speed_group)
         
-        # Configure grid weights
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.columnconfigure(2, weight=1)
-        stats_frame.columnconfigure(1, weight=1)
-        button_frame.columnconfigure(0, weight=1)
-        button_frame.columnconfigure(1, weight=1)
-        button_frame.columnconfigure(2, weight=1)
-        speed_frame.columnconfigure(1, weight=1)
+        # Decrease speed button
+        decrease_btn = QPushButton("-")
+        decrease_btn.setFixedWidth(30)
+        decrease_btn.clicked.connect(self.decrease_speed)
+        speed_layout.addWidget(decrease_btn)
         
-    def _run_async_loop(self):
-        """Run the asyncio event loop in a separate thread"""
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
+        # Speed entry
+        self.speed_entry = QLineEdit("2.0")
+        self.speed_entry.setFixedWidth(60)
+        self.speed_entry.setAlignment(self.speed_entry.alignment().__class__.AlignCenter)
+        self.speed_entry.returnPressed.connect(self.set_speed_from_entry)
+        speed_layout.addWidget(self.speed_entry)
         
-    def update_status(self):
-        """Periodically update the display with current status"""
+        # Increase speed button
+        increase_btn = QPushButton("+")
+        increase_btn.setFixedWidth(30)
+        increase_btn.clicked.connect(self.increase_speed)
+        speed_layout.addWidget(increase_btn)
+        
+        main_layout.addWidget(speed_group)
+        
+    def set_button_color(self, button: QPushButton, color: str):
+        """Set button text color"""
+        button.setStyleSheet(f"QPushButton {{ color: {color}; }}")
+        
+    def auto_connect(self):
+        """On startup, check if WalkingPad is already connected at system BT level and hook in"""
+        if not self.connected and self.pad_address:
+            self.async_worker.run_coroutine(
+                self.async_worker.check_and_auto_connect(self.pad_address)
+            )
+
+    def request_status_update(self):
+        """Request status update from async worker"""
         if self.connected:
-            # Request status update
-            asyncio.run_coroutine_threadsafe(self._get_status(), self.loop)
+            self.async_worker.run_coroutine(self.async_worker.get_status())
             
-        # Schedule next update
-        self.root.after(1000, self.update_status)
-        
-    async def _get_status(self):
-        """Get current status from WalkingPad"""
-        try:
-            # Ask for statistics - this updates the controller's internal state
-            await self.controller.ask_stats()
-            
-            # The status should be available in the controller after ask_stats
-            # We need to access it from the controller's last received status
-            if hasattr(self.controller, 'last_status') and self.controller.last_status:
-                self.current_status = self.controller.last_status
-                self.root.after(0, self._update_display)
-                
-                # Sync with Home Assistant if enabled and enough time has passed
-                current_time = time.time()
-                if (current_time - self.last_sync_time) >= self.sync_interval:
-                    if self.current_status and hasattr(self.current_status, 'steps') and self.current_status.steps is not None:
-                        if self.ha_sync.update_steps(self.current_status.steps):
-                            self.last_sync_time = current_time
-                        
-        except Exception as e:
-            print(f"Error getting status: {e}")
-            
-    def _update_display(self):
+    def update_display(self, status: WalkingPadCurStatus):
         """Update the GUI display with current status"""
-        if not self.current_status:
-            return
-            
-        status = self.current_status
+        self.current_status = status
         
         # Update speed display
         speed_kmh = status.speed / 10.0
-        self.speed_label.config(text=f"{speed_kmh:.1f} km/h")
+        self.speed_label.setText(f"{speed_kmh:.1f} km/h")
         
-        # Update steps display (session only)
-        self.steps_label.config(text=f"{status.steps:,}")
+        # Update steps display
+        self.steps_label.setText(f"{status.steps:,}")
         
         # Update start/stop button based on belt state
         if status.belt_state == 1:  # Running
-            self.start_btn.config(text="STP")
+            self.start_btn.setText("STP")
         else:  # Stopped
-            self.start_btn.config(text="GO")
+            self.start_btn.setText("GO")
             
-    def _update_connection_status(self):
+        # Sync with Home Assistant if enabled and enough time has passed
+        current_time = time.time()
+        if (current_time - self.last_sync_time) >= self.sync_interval:
+            if status.steps is not None:
+                if self.ha_sync.update_steps(status.steps):
+                    self.last_sync_time = current_time
+                    
+    def update_connection_status(self, connected: bool):
         """Update connection status display"""
-        if self.connected:
-            self.connect_btn.config(text="D")
-            # Create a style for connected state
-            style = ttk.Style()
-            style.configure("Connected.TButton", foreground="green")
-            self.connect_btn.config(style="Connected.TButton")
-            self.start_btn.config(state="normal")
+        self.connected = connected
+        
+        if connected:
+            self.connect_btn.setText("D")
+            self.set_button_color(self.connect_btn, "green")
+            self.start_btn.setEnabled(True)
         else:
-            self.connect_btn.config(text="C")
-            # Create a style for disconnected state
-            style = ttk.Style()
-            style.configure("Disconnected.TButton", foreground="red")
-            self.connect_btn.config(style="Disconnected.TButton")
-            self.start_btn.config(state="disabled", text="Play")
-            self.speed_label.config(text="0.0 km/h")
-            self.steps_label.config(text="0")
+            self.connect_btn.setText("C")
+            self.set_button_color(self.connect_btn, "red")
+            self.start_btn.setEnabled(False)
+            self.start_btn.setText("GO")
+            self.speed_label.setText("0.0 km/h")
+            self.steps_label.setText("0")
+            # Reset session on disconnect
+            self.ha_sync.session_initialized = False
             
+    def show_error(self, message: str):
+        """Show error message"""
+        QMessageBox.critical(self, "Error", message)
+        
     def toggle_connection(self):
         """Connect or disconnect from WalkingPad"""
         if self.connected:
-            asyncio.run_coroutine_threadsafe(self._disconnect(), self.loop)
+            self.async_worker.run_coroutine(self.async_worker.disconnect())
         else:
-            asyncio.run_coroutine_threadsafe(self._connect(), self.loop)
-            
-    async def _connect(self):
-        """Connect to WalkingPad"""
-        try:
-            await self.controller.run(self.pad_address)
-            self.connected = True
-            self.root.after(0, self._update_connection_status)
-        except Exception as ex:
-            error_msg = f"Failed to connect: {ex}"
-            self.root.after(0, lambda: messagebox.showerror("Connection Error", error_msg))
-            
-    async def _disconnect(self):
-        """Disconnect from WalkingPad"""
-        try:
-            # Stop belt and switch to standby before disconnecting
-            if self.current_status and self.current_status.belt_state == 1:
-                await self.controller.stop_belt()
-                await asyncio.sleep(1.0)
-            await self.controller.switch_mode(WalkingPad.MODE_STANDBY)
-            await self.controller.disconnect()
-            self.connected = False
-            self.current_status = None
-            # Reset session on disconnect
-            self.ha_sync.session_initialized = False
-            self.root.after(0, self._update_connection_status)
-        except Exception as e:
-            print(f"Error disconnecting: {e}")
+            self.async_worker.run_coroutine(self.async_worker.connect(self.pad_address))
             
     def toggle_belt(self):
         """Start or stop the belt"""
@@ -398,157 +544,159 @@ class WalkingPadGUI:
             
         if self.current_status and self.current_status.belt_state == 1:
             # Stop the belt
-            asyncio.run_coroutine_threadsafe(self.controller.stop_belt(), self.loop)
+            self.async_worker.run_coroutine(self.async_worker.stop_belt())
         else:
-            # Start the belt - set manual mode first, then start
-            asyncio.run_coroutine_threadsafe(self._start_belt_sequence(), self.loop)
+            # Start the belt
+            self.async_worker.run_coroutine(self.async_worker.start_belt())
+            # Set initial speed after a delay
+            QTimer.singleShot(10000, self.set_initial_speed)
             
-    async def _start_belt_sequence(self):
-        """Start belt sequence: set manual mode then start belt"""
+    def set_initial_speed(self):
+        """Set initial speed after belt starts"""
         try:
-            await self.controller.switch_mode(WalkingPad.MODE_MANUAL)
-            await asyncio.sleep(1.0)
-            await self.controller.start_belt()
+            speed = float(self.speed_entry.text())
+            speed = max(0.5, min(6.0, speed))
+            self.async_worker.run_coroutine(self.async_worker.set_speed(speed))
+        except ValueError:
+            pass
             
-            # Set speed from input field after starting
-            await asyncio.sleep(5)  # Give belt a moment to start
-            initial_speed = float(self.speed_var.get())
-            await self._set_speed(initial_speed)
-
-        except Exception as e:
-            print(f"Error starting belt: {e}")
-            
-    def set_speed_from_entry(self, event=None):
+    def set_speed_from_entry(self):
         """Set speed from entry widget"""
         try:
-            speed = float(self.speed_var.get())
-            speed = max(0.5, min(6.0, speed))  # Clamp to valid range
-            self.speed_var.set(f"{speed:.1f}")
-            asyncio.run_coroutine_threadsafe(self._set_speed(speed), self.loop)
+            speed = float(self.speed_entry.text())
+            speed = max(0.5, min(6.0, speed))
+            self.speed_entry.setText(f"{speed:.1f}")
+            self.async_worker.run_coroutine(self.async_worker.set_speed(speed))
         except ValueError:
-            self.speed_var.set("1.0")
+            self.speed_entry.setText("1.0")
             
     def increase_speed(self):
         """Increase speed by 0.5 km/h"""
         try:
-            current = float(self.speed_var.get())
+            current = float(self.speed_entry.text())
             new_speed = min(6.0, current + 0.5)
-            self.speed_var.set(f"{new_speed:.1f}")
-            asyncio.run_coroutine_threadsafe(self._set_speed(new_speed), self.loop)
+            self.speed_entry.setText(f"{new_speed:.1f}")
+            self.async_worker.run_coroutine(self.async_worker.set_speed(new_speed))
         except ValueError:
             pass
             
     def decrease_speed(self):
         """Decrease speed by 0.5 km/h"""
         try:
-            current = float(self.speed_var.get())
+            current = float(self.speed_entry.text())
             new_speed = max(0.5, current - 0.5)
-            self.speed_var.set(f"{new_speed:.1f}")
-            asyncio.run_coroutine_threadsafe(self._set_speed(new_speed), self.loop)
+            self.speed_entry.setText(f"{new_speed:.1f}")
+            self.async_worker.run_coroutine(self.async_worker.set_speed(new_speed))
         except ValueError:
             pass
             
-    async def _set_speed(self, speed_kmh: float):
-        """Set belt speed"""
-        if not self.connected:
-            return
-            
-        try:
-            # Convert km/h to internal units (speed * 10)
-            speed_units = int(speed_kmh * 10)
-            await self.controller.change_speed(speed_units)
-        except Exception as e:
-            print(f"Error setting speed: {e}")
-            
     def open_settings(self):
         """Open settings dialog"""
-        SettingsDialog(self.root, self)
-        
-    def on_closing(self):
-        """Handle application closing"""
+        dialog = SettingsDialog(self)
+        if dialog.exec():
+            # Settings were saved, update configuration
+            self.ha_sync = HomeAssistantSync(
+                url=self.ha_url,
+                token=self.ha_token,
+                entity_id=self.ha_entity_id
+            )
+            
+    def closeEvent(self, event):
+        """Handle window close event"""
         if self.connected:
-            asyncio.run_coroutine_threadsafe(self._disconnect(), self.loop)
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.root.destroy()
+            self.async_worker.run_coroutine(self.async_worker.disconnect())
+        
+        # Stop the async worker and thread
+        self.async_worker.stop_loop()
+        self.async_thread.quit()
+        self.async_thread.wait()
+        
+        event.accept()
 
 
-class SettingsDialog:
+class SettingsDialog(QDialog):
     """Settings dialog for configuration"""
     
-    def __init__(self, parent: tk.Tk, app: WalkingPadGUI):
-        self.app = app
+    def __init__(self, parent: WalkingPadGUI):
+        super().__init__(parent)
+        self.app = parent
         
-        # Create dialog window
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("Settings")
-        self.dialog.geometry("400x280")
-        self.dialog.resizable(False, False)
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
-        
-        # Center the dialog
-        self.dialog.geometry("+%d+%d" % (parent.winfo_rootx() + 50, parent.winfo_rooty() + 50))
+        self.setWindowTitle("Settings")
+        self.setFixedSize(400, 280)
+        self.setModal(True)
         
         self.setup_dialog()
         
     def setup_dialog(self):
         """Create dialog content"""
-        notebook = ttk.Notebook(self.dialog)
-        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        layout = QVBoxLayout(self)
+        
+        # Tab widget
+        tab_widget = QTabWidget()
+        layout.addWidget(tab_widget)
         
         # WalkingPad settings tab
-        pad_frame = ttk.Frame(notebook)
-        notebook.add(pad_frame, text="WalkingPad")
+        pad_widget = QWidget()
+        pad_layout = QGridLayout(pad_widget)
         
-        ttk.Label(pad_frame, text="MAC Address:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.address_var = tk.StringVar(value=self.app.pad_address)
-        address_entry = ttk.Entry(pad_frame, textvariable=self.address_var, width=20)
-        address_entry.grid(row=0, column=1, padx=5, pady=5)
+        pad_layout.addWidget(QLabel("MAC Address:"), 0, 0)
+        self.address_entry = QLineEdit(self.app.pad_address)
+        pad_layout.addWidget(self.address_entry, 0, 1)
         
-        ttk.Label(pad_frame, text="Sync Interval (seconds):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.sync_var = tk.StringVar(value=str(self.app.sync_interval))
-        sync_entry = ttk.Entry(pad_frame, textvariable=self.sync_var, width=10)
-        sync_entry.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        pad_layout.addWidget(QLabel("Sync Interval (seconds):"), 1, 0)
+        self.sync_entry = QLineEdit(str(self.app.sync_interval))
+        pad_layout.addWidget(self.sync_entry, 1, 1)
+        
+        tab_widget.addTab(pad_widget, "WalkingPad")
         
         # Home Assistant settings tab
-        ha_frame = ttk.Frame(notebook)
-        notebook.add(ha_frame, text="Home Assistant")
+        ha_widget = QWidget()
+        ha_layout = QGridLayout(ha_widget)
         
-        ttk.Label(ha_frame, text="Home Assistant URL:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.ha_url_var = tk.StringVar(value=self.app.ha_url)
-        ha_url_entry = ttk.Entry(ha_frame, textvariable=self.ha_url_var, width=30)
-        ha_url_entry.grid(row=0, column=1, padx=5, pady=5)
+        ha_layout.addWidget(QLabel("Home Assistant URL:"), 0, 0)
+        self.ha_url_entry = QLineEdit(self.app.ha_url)
+        ha_layout.addWidget(self.ha_url_entry, 0, 1)
         
-        ttk.Label(ha_frame, text="Access Token:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.ha_token_var = tk.StringVar(value=self.app.ha_token)
-        ha_token_entry = ttk.Entry(ha_frame, textvariable=self.ha_token_var, width=30, show="*")
-        ha_token_entry.grid(row=1, column=1, padx=5, pady=5)
+        ha_layout.addWidget(QLabel("Access Token:"), 1, 0)
+        self.ha_token_entry = QLineEdit(self.app.ha_token)
+        self.ha_token_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        ha_layout.addWidget(self.ha_token_entry, 1, 1)
         
-        ttk.Label(ha_frame, text="Input Number Entity ID:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
-        self.ha_entity_var = tk.StringVar(value=self.app.ha_entity_id)
-        ha_entity_entry = ttk.Entry(ha_frame, textvariable=self.ha_entity_var, width=30)
-        ha_entity_entry.grid(row=2, column=1, padx=5, pady=5)
+        ha_layout.addWidget(QLabel("Input Number Entity ID:"), 2, 0)
+        self.ha_entity_entry = QLineEdit(self.app.ha_entity_id)
+        ha_layout.addWidget(self.ha_entity_entry, 2, 1)
         
-        ttk.Label(ha_frame, text="Example: input_number.total_steps_all_time").grid(row=3, column=1, sticky=tk.W, padx=5, pady=(0, 5))
+        example_label = QLabel("Example: input_number.total_steps_all_time")
+        example_label.setStyleSheet("color: gray; font-style: italic;")
+        ha_layout.addWidget(example_label, 3, 1)
         
         # Test button
-        test_btn = ttk.Button(ha_frame, text="Test Connection", command=self.test_ha_connection)
-        test_btn.grid(row=4, column=0, columnspan=2, pady=10)
+        test_btn = QPushButton("Test Connection")
+        test_btn.clicked.connect(self.test_ha_connection)
+        ha_layout.addWidget(test_btn, 4, 0, 1, 2)
         
-        # Buttons frame
-        btn_frame = ttk.Frame(self.dialog)
-        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        tab_widget.addTab(ha_widget, "Home Assistant")
         
-        ttk.Button(btn_frame, text="Save", command=self.save_settings).pack(side="right", padx=(5, 0))
-        ttk.Button(btn_frame, text="Cancel", command=self.dialog.destroy).pack(side="right")
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+        
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.save_settings)
+        button_layout.addWidget(save_btn)
+        
+        layout.addLayout(button_layout)
         
     def test_ha_connection(self):
         """Test Home Assistant connection"""
-        url = self.ha_url_var.get().strip().rstrip('/')
-        token = self.ha_token_var.get().strip()
+        url = self.ha_url_entry.text().strip().rstrip('/')
+        token = self.ha_token_entry.text().strip()
         
         if not url or not token:
-            messagebox.showwarning("Test Connection", "Please enter URL and token first")
+            QMessageBox.warning(self, "Test Connection", "Please enter URL and token first")
             return
             
         try:
@@ -556,55 +704,52 @@ class SettingsDialog:
             response = requests.get(f"{url}/api/", headers=headers, timeout=5)
             
             if response.status_code == 200:
-                messagebox.showinfo("Test Connection", "Connection successful!")
+                QMessageBox.information(self, "Test Connection", "Connection successful!")
             else:
-                messagebox.showerror("Test Connection", f"Connection failed: {response.status_code}")
+                QMessageBox.critical(self, "Test Connection", f"Connection failed: {response.status_code}")
                 
         except Exception as e:
-            messagebox.showerror("Test Connection", f"Connection failed: {e}")
+            QMessageBox.critical(self, "Test Connection", f"Connection failed: {e}")
             
     def save_settings(self):
         """Save settings and close dialog"""
         # Update WalkingPad settings
-        self.app.pad_address = self.address_var.get().strip()
+        self.app.pad_address = self.address_entry.text().strip()
         
         try:
-            self.app.sync_interval = max(10, int(self.sync_var.get()))
+            self.app.sync_interval = max(10, int(self.sync_entry.text()))
         except ValueError:
             self.app.sync_interval = 30
             
         # Update Home Assistant settings
-        self.app.ha_url = self.ha_url_var.get().strip()
-        self.app.ha_token = self.ha_token_var.get().strip()
-        self.app.ha_entity_id = self.ha_entity_var.get().strip()
-        
-        # Recreate Home Assistant sync object with new settings
-        self.app.ha_sync = HomeAssistantSync(
-            url=self.app.ha_url,
-            token=self.app.ha_token,
-            entity_id=self.app.ha_entity_id
-        )
+        self.app.ha_url = self.ha_url_entry.text().strip()
+        self.app.ha_token = self.ha_token_entry.text().strip()
+        self.app.ha_entity_id = self.ha_entity_entry.text().strip()
         
         # Save configuration to disk
         self.app.save_config()
         
-        messagebox.showinfo("Settings", "Settings saved successfully!")
-        self.dialog.destroy()
+        QMessageBox.information(self, "Settings", "Settings saved successfully!")
+        self.accept()
 
 
 def main():
     """Main application entry point"""
-    root = tk.Tk()
-    app = WalkingPadGUI(root)
+    app = QApplication(sys.argv)
     
-    # Handle window closing
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    # Set application properties
+    app.setApplicationName("WalkingPad Controller")
+    app.setApplicationVersion("2.0")
+    
+    # Create and show main window
+    window = WalkingPadGUI()
+    window.show()
     
     try:
-        root.mainloop()
+        sys.exit(app.exec())
     except KeyboardInterrupt:
-        app.on_closing()
+        sys.exit(0)
 
 
 if __name__ == "__main__":
-    main() 
+    main()

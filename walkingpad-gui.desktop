@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=WalkingPad GUI
 Comment=Simple controller for WalkingPad treadmills
-Exec=/home/victor/Projects/walkingpad/walkingpad-gui/run.sh
+Exec=/home/victor/Projects/walkingpad-gui/run.sh
 Icon=applications-sports
 Terminal=false
 Type=Application
